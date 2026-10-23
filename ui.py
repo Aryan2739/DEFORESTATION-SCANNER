@@ -926,7 +926,8 @@ def main():
         "<div class='cm-foot-note'>",
         f"<a class='cm-link' href='/?sid={visitor_sid}&amp;view=privacy' target='_self'>Privacy Policy</a>",
         f"<a class='cm-link' href='/?sid={visitor_sid}&amp;view=terms' target='_self'>Terms &amp; Conditions</a>",
-        f"<a class='cm-link' href='mailto:{CONTACT_EMAIL}'>Inquiries: {CONTACT_EMAIL}</a>",
+      f"<a class='cm-link' href='mailto:{CONTACT_EMAIL}'>Inquiries: {CONTACT_EMAIL}</a>",
+     "<a class='cm-link' href='https://github.com/Aryan2739/DEFORESTATION-SCANNER/issues' target='_blank' rel='noopener'>GitHub Issue Tracker</a>",
         "</div></div>",
         "</div></div>",
     ])
