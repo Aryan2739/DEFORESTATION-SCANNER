@@ -5,6 +5,7 @@ import datetime
 import gc
 import logging
 import os
+import threading
 from pathlib import Path
 import urllib.request
 import uuid
@@ -38,6 +39,7 @@ from exports import (
     load_last_result,
     make_gif,
     make_markdown,
+    make_metrics_csv,
     make_overlay,
     save_last_result,
     to_geojson,
@@ -98,6 +100,11 @@ def _get_hero_image_uris():
             uris.append(remote_url)
     return uris[0], uris[1]
 
+
+@st.cache_resource(show_spinner=False)
+def _get_analysis_lock():
+    """Serialize expensive raster analyses within this Streamlit process."""
+    return threading.Lock()
 
 def _get_visitor_session_id():
     """
@@ -209,7 +216,7 @@ def _inject_theme_and_hero():
                 '[theme]\nbase = "light"\nprimaryColor = "#1f5c3f"\n'
                 'backgroundColor = "#f4f7f3"\nsecondaryBackgroundColor = "#e9efe9"\n'
                 'textColor = "#10231a"\n\n'
-                '[client]\nshowErrorDetails = false\ntoolbarMode = "minimal"\n'
+                '[client]\nshowErrorDetails = "none"\ntoolbarMode = "minimal"\n'
             )
     except OSError as exc:
         logger.warning("Could not write .streamlit/config.toml: %s", exc)
@@ -694,113 +701,120 @@ def main():
                     st.error(err_msg)
                 st.stop()
 
-            west, south, east, north = bbox
-            years = list(range(y1 + 1, y2 + 1)) if timeline else [y2]
+            analysis_lock = _get_analysis_lock()
+            if not analysis_lock.acquire(blocking=False):
+                st.warning("Another visitor's analysis is still running. Please retry in a moment.")
+                st.stop()
+            try:
+                west, south, east, north = bbox
+                years = list(range(y1 + 1, y2 + 1)) if timeline else [y2]
 
-            with st.status("Executing Sentinel-2 STAC multi-spectral pipeline...", expanded=True) as status:
-                st.write(f"Compositing baseline Sentinel-2 L2A tiles for {y1}...")
-                base_comp, base_err = build_composite(tuple(bbox), y1, m1, m2, max_cloud, res)
-                if base_comp is None:
-                    status.update(label="Pipeline stopped", state="error")
-                    st.error(base_err)
-                    st.stop()
-
-                rgb_b = base_comp["rgb"]
-                ndvi_b, nbr_b, ndwi_b = base_comp["ndvi"], base_comp["nbr"], base_comp["ndwi"]
-                valid_b, n_b = base_comp["valid_mask"], base_comp["scene_count"]
-                crs, transform = base_comp["crs"], base_comp["transform"]
-                H_b, W_b = rgb_b.shape[:2]
-
-                ha_px = (res * res) / 10000.0
-                frames, tl_ha = [], []
-                final_loss = final_forest = final_rgb_a = None
-                n_a = 0
-                H, W = H_b, W_b
-
-                for yr in years:
-                    st.write(f"Compositing target Sentinel-2 L2A tiles for {yr} & detecting canopy change...")
-                    yr_comp, yr_err = build_composite(tuple(bbox), yr, m1, m2, max_cloud, res)
-                    if yr_comp is None:
+                with st.status("Executing Sentinel-2 STAC multi-spectral pipeline...", expanded=True) as status:
+                    st.write(f"Compositing baseline Sentinel-2 L2A tiles for {y1}...")
+                    base_comp, base_err = build_composite(tuple(bbox), y1, m1, m2, max_cloud, res)
+                    if base_comp is None:
                         status.update(label="Pipeline stopped", state="error")
-                        st.error(yr_err)
+                        st.error(base_err)
                         st.stop()
 
-                    H = min(H_b, yr_comp["rgb"].shape[0])
-                    W = min(W_b, yr_comp["rgb"].shape[1])
+                    rgb_b = base_comp["rgb"]
+                    ndvi_b, nbr_b, ndwi_b = base_comp["ndvi"], base_comp["nbr"], base_comp["ndwi"]
+                    valid_b, n_b = base_comp["valid_mask"], base_comp["scene_count"]
+                    crs, transform = base_comp["crs"], base_comp["transform"]
+                    H_b, W_b = rgb_b.shape[:2]
 
-                    loss, forest = detect_loss(
-                        ndvi_b[:H, :W], nbr_b[:H, :W], ndwi_b[:H, :W], valid_b[:H, :W],
-                        yr_comp["ndvi"][:H, :W], yr_comp["nbr"][:H, :W], yr_comp["ndwi"][:H, :W], yr_comp["valid_mask"][:H, :W],
-                        min_drop=min_drop, forest_thresh=forest_thresh,
+                    ha_px = (res * res) / 10000.0
+                    frames, tl_ha = [], []
+                    final_loss = final_forest = final_rgb_a = None
+                    n_a = 0
+                    H, W = H_b, W_b
+
+                    for yr in years:
+                        st.write(f"Compositing target Sentinel-2 L2A tiles for {yr} & detecting canopy change...")
+                        yr_comp, yr_err = build_composite(tuple(bbox), yr, m1, m2, max_cloud, res)
+                        if yr_comp is None:
+                            status.update(label="Pipeline stopped", state="error")
+                            st.error(yr_err)
+                            st.stop()
+
+                        H = min(H_b, yr_comp["rgb"].shape[0])
+                        W = min(W_b, yr_comp["rgb"].shape[1])
+
+                        loss, forest = detect_loss(
+                            ndvi_b[:H, :W], nbr_b[:H, :W], ndwi_b[:H, :W], valid_b[:H, :W],
+                            yr_comp["ndvi"][:H, :W], yr_comp["nbr"][:H, :W], yr_comp["ndwi"][:H, :W], yr_comp["valid_mask"][:H, :W],
+                            min_drop=min_drop, forest_thresh=forest_thresh,
+                        )
+                        frames.append(make_overlay(yr_comp["rgb"][:H, :W], loss))
+                        tl_ha.append(float(loss.sum() * ha_px))
+
+                        if yr == y2:
+                            final_loss, final_forest = loss, forest
+                            final_rgb_a = yr_comp["rgb"][:H, :W]
+                            n_a = yr_comp["scene_count"]
+
+                        del yr_comp
+                        gc.collect()
+
+                    hansen_warnings = []
+                    acc = acc_img = last_year = hansen_ver = None
+                    if check_acc:
+                        st.write("Loading Hansen GFC reference layers for independent validation...")
+                        h_res, h_err = hansen_truth(tuple(bbox), crs, transform, (H, W), y1, y2)
+                        if h_err:
+                            hansen_warnings.append(h_err)
+                        if h_res is not None:
+                            last_year, hansen_ver = h_res["last_yr"], h_res["version"]
+                            acc, acc_img = accuracy(final_loss, h_res["truth_strict"], final_rgb_a, truth_buffered=h_res["truth_buffered"])
+
+                    labeled, num_patches = ndimage.label(final_loss)
+                    patch_sizes = (np.bincount(labeled.ravel())[1:] * ha_px) if num_patches > 0 else np.array([])
+                    major_clearings = int((patch_sizes >= 5.0).sum())
+                    loss_ha, forest_ha = tl_ha[-1], float(final_forest.sum() * ha_px)
+                    co2 = loss_ha * biomass * 0.47 * 3.67
+
+                    facts = {
+                        "region": place if REGIONS[place] else f"AOI ({west:.2f}, {south:.2f}, {east:.2f}, {north:.2f})",
+                        "compared_years": f"{y1} vs {y2}",
+                        "baseline_canopy_ha": round(forest_ha),
+                        "canopy_loss_detected_ha": round(loss_ha, 1),
+                        "percent_canopy_loss_detected": round(100.0 * loss_ha / max(forest_ha, 1.0), 2),
+                        "disturbance_patches_count": int(num_patches),
+                        "major_patches_over_5ha": major_clearings,
+                        "potential_co2_equiv_tonnes": round(co2),
+                    }
+                    summary = (
+                        f"Multi-spectral comparison between {y1} and {y2} detected {loss_ha:,.1f} ha "
+                        f"({facts['percent_canopy_loss_detected']}%) of spectral canopy loss across {num_patches} "
+                        f"disturbance patches ({major_clearings} patches >= 5 ha). If caused by permanent biomass "
+                        f"removal rather than seasonal phenology or fire recovery, this corresponds to approximately {co2:,.0f} tCO2."
                     )
-                    frames.append(make_overlay(yr_comp["rgb"][:H, :W], loss))
-                    tl_ha.append(float(loss.sum() * ha_px))
 
-                    if yr == y2:
-                        final_loss, final_forest = loss, forest
-                        final_rgb_a = yr_comp["rgb"][:H, :W]
-                        n_a = yr_comp["scene_count"]
+                    ai_briefing, ai_err = generate_optional_ai_briefing(facts, acc)
+                    if ai_err:
+                        hansen_warnings.append(ai_err)
 
-                    del yr_comp
-                    gc.collect()
+                    geojson_str = to_geojson(final_loss, transform, crs, ha_px)
+                    gif = make_gif(frames, years, tl_ha, y1) if len(frames) > 1 else None
+                    status.update(label="Analysis complete", state="complete", expanded=False)
 
-                hansen_warnings = []
-                acc = acc_img = last_year = hansen_ver = None
-                if check_acc:
-                    st.write("Loading Hansen GFC reference layers for independent validation...")
-                    h_res, h_err = hansen_truth(tuple(bbox), crs, transform, (H, W), y1, y2)
-                    if h_err:
-                        hansen_warnings.append(h_err)
-                    if h_res is not None:
-                        last_year, hansen_ver = h_res["last_yr"], h_res["version"]
-                        acc, acc_img = accuracy(final_loss, h_res["truth_strict"], final_rgb_a, truth_buffered=h_res["truth_buffered"])
-
-                labeled, num_patches = ndimage.label(final_loss)
-                patch_sizes = (np.bincount(labeled.ravel())[1:] * ha_px) if num_patches > 0 else np.array([])
-                major_clearings = int((patch_sizes >= 5.0).sum())
-                loss_ha, forest_ha = tl_ha[-1], float(final_forest.sum() * ha_px)
-                co2 = loss_ha * biomass * 0.47 * 3.67
-
-                facts = {
-                    "region": place if REGIONS[place] else f"AOI ({west:.2f}, {south:.2f}, {east:.2f}, {north:.2f})",
-                    "compared_years": f"{y1} vs {y2}",
-                    "baseline_canopy_ha": round(forest_ha),
-                    "canopy_loss_detected_ha": round(loss_ha, 1),
-                    "percent_canopy_loss_detected": round(100.0 * loss_ha / max(forest_ha, 1.0), 2),
-                    "disturbance_patches_count": int(num_patches),
-                    "major_patches_over_5ha": major_clearings,
-                    "potential_co2_equiv_tonnes": round(co2),
-                }
-                summary = (
-                    f"Multi-spectral comparison between {y1} and {y2} detected {loss_ha:,.1f} ha "
-                    f"({facts['percent_canopy_loss_detected']}%) of spectral canopy loss across {num_patches} "
-                    f"disturbance patches ({major_clearings} patches >= 5 ha). If caused by permanent biomass "
-                    f"removal rather than seasonal phenology or fire recovery, this corresponds to approximately {co2:,.0f} tCO2."
+                result_bundle = dict(
+                    facts=facts, summary=summary, ai_briefing=ai_briefing, warnings=hansen_warnings,
+                    overlay=frames[-1], years=(y1, y2), scenes=(n_b, n_a),
+                    rgb_b=(rgb_b[:H, :W] * 255).astype("uint8"), rgb_a=(final_rgb_a * 255).astype("uint8"),
+                    tl=(years, tl_ha, frames), gif=gif, acc=acc, acc_img=acc_img,
+                    last_year=last_year, hansen_ver=hansen_ver, geojson=geojson_str,
                 )
-
-                ai_briefing, ai_err = generate_optional_ai_briefing(facts, acc)
-                if ai_err:
-                    hansen_warnings.append(ai_err)
-
-                geojson_str = to_geojson(final_loss, transform, crs, ha_px)
-                gif = make_gif(frames, years, tl_ha, y1) if len(frames) > 1 else None
-                status.update(label="Analysis complete", state="complete", expanded=False)
-
-            result_bundle = dict(
-                facts=facts, summary=summary, ai_briefing=ai_briefing, warnings=hansen_warnings,
-                overlay=frames[-1], years=(y1, y2), scenes=(n_b, n_a),
-                rgb_b=(rgb_b[:H, :W] * 255).astype("uint8"), rgb_a=(final_rgb_a * 255).astype("uint8"),
-                tl=(years, tl_ha, frames), gif=gif, acc=acc, acc_img=acc_img,
-                last_year=last_year, hansen_ver=hansen_ver, geojson=geojson_str,
-            )
-            st.session_state["result"] = result_bundle
-            st.session_state["restored_from_disk"] = False
-            save_err = save_last_result(result_bundle, session_id=visitor_sid)
-            if save_err:
-                st.session_state["pending_toast"] = ("Analysis complete, but saving it to disk failed.", "⚠️")
-            else:
-                st.session_state["pending_toast"] = ("Analysis complete. Results are ready.", "✅")
-            st.rerun()
+                st.session_state["result"] = result_bundle
+                st.session_state["restored_from_disk"] = False
+                save_err = save_last_result(result_bundle, session_id=visitor_sid)
+                if save_err:
+                    st.session_state["pending_toast"] = ("Analysis complete, but saving it to disk failed.", "⚠️")
+                else:
+                    st.session_state["pending_toast"] = ("Analysis complete. Results are ready.", "✅")
+                st.rerun()
+            finally:
+                analysis_lock.release()
 
         r = st.session_state.get("result")
         if r:
@@ -896,7 +910,7 @@ def main():
 
             d1, d2, d3, d4 = st.columns(4)
             d1.download_button("Download Report (.MD)", make_markdown(r, st.session_state.get("story", "")), file_name="canopy_loss_report.md", use_container_width=True)
-            d2.download_button("Download Telemetry (.CSV)", "\n".join(f"{k},{v}" for k, v in f.items()), file_name="canopy_loss_metrics.csv", use_container_width=True)
+            d2.download_button("Download Telemetry (.CSV)", make_metrics_csv(r), file_name="canopy_loss_metrics.csv", mime="text/csv", use_container_width=True)
             d3.download_button("Download Loss Raster (.PNG)", to_png(r["overlay"]), file_name="canopy_loss_detected.png", mime="image/png", use_container_width=True)
             d4.download_button("Download Polygons (.GEOJSON)", r["geojson"], file_name="canopy_loss_detected.geojson", mime="application/geo+json", use_container_width=True)
 

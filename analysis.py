@@ -100,12 +100,12 @@ def geocode_place(query):
     except urllib.error.HTTPError as exc:
         logger.warning("Geocoding HTTP error: %s", exc)
         return None, f"Geocoding service returned HTTP {exc.code}."
-    except urllib.error.URLError as exc:
-        logger.warning("Geocoding network error: %s", exc)
-        return None, f"Network error while reaching OpenStreetMap: {exc.reason}"
-    except Exception as exc:
-        logger.warning("Geocoding unexpected error: %s", exc)
-        return None, f"Unexpected geocoding error: {exc}"
+    except urllib.error.URLError:
+        logger.exception("Place geocoding request failed")
+        return None, "Location lookup failed. Please retry or enter coordinates."
+    except Exception:
+        logger.exception("Unexpected place geocoding failure")
+        return None, "Location lookup failed. Please retry or enter coordinates."
 
 
 def validate_run_params(bbox, y1, y2, m1, m2, res, timeline, today=None):
@@ -165,9 +165,9 @@ def build_composite(bbox, year, m1, m2, max_cloud, res):
             datetime=f"{year}-{m1:02d}-01/{year}-{m2:02d}-{last_day:02d}",
             query={"eo:cloud_cover": {"lt": max_cloud}},
         ).item_collection()
-    except Exception as exc:
-        logger.error("STAC search failed for %s: %s", year, exc)
-        return None, f"STAC catalog search failed for {year}: {exc}"
+    except Exception:
+        logger.exception("STAC catalog search failed for %s", year)
+        return None, f"Satellite catalog search failed for {year}. Please retry later."
 
     if not all_items:
         return None, (
@@ -220,9 +220,9 @@ def build_composite(bbox, year, m1, m2, max_cloud, res):
         )
         del ds, raw, spec
         gc.collect()
-    except Exception as exc:
-        logger.error("Raster composite load failed for %s: %s", year, exc)
-        return None, f"Failed to load and composite Sentinel-2 bands for {year}: {exc}"
+    except Exception:
+        logger.exception("Raster composite load failed for %s", year)
+        return None, f"Satellite processing failed for {year}. Retry later or choose a smaller area."
 
     return {
         "rgb": rgb,
@@ -293,14 +293,14 @@ def read_hansen_layer(layer, ver, tiles, bbox, shape, transform, crs):
             resampling=Resampling.nearest,
         )
         return dest, None
-    except Exception as exc:
+    except Exception:
         for ds in datasets:
             try:
                 ds.close()
             except Exception:
                 pass
-        logger.warning("Hansen %s (%s) read failed: %s", layer, ver, exc)
-        return None, f"{ver}/{layer}: {exc}"
+        logger.exception("Hansen %s (%s) read failed", layer, ver)
+        return None, "Reference data tile download failed."
 
 
 @st.cache_data(show_spinner=False, max_entries=6)
@@ -351,7 +351,7 @@ def hansen_truth(bbox, crs, _transform, shape, y1, y2):
         if err:
             errors.append(err)
 
-    return None, "Could not load Hansen GFC reference tiles (" + "; ".join(errors) + ")."
+    return None, "Could not load the Hansen reference data. Validation was skipped; please retry later."
 
 
 def _compute_metrics(tp_count, fp_count, fn_count):
@@ -446,7 +446,7 @@ def generate_optional_ai_briefing(facts, acc):
             content = payload.get("content", [])
             if content and "text" in content[0]:
                 return content[0]["text"].strip(), None
-    except Exception as exc:
-        logger.warning("Server-side AI summary generation failed: %s", exc)
-        return None, f"Optional AI briefing skipped ({exc})."
+    except Exception:
+        logger.exception("Server-side AI summary generation failed")
+        return None, "Optional AI briefing could not be generated; the core analysis completed."
     return None, None

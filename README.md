@@ -13,5 +13,6 @@ A Streamlit geospatial workbench that detects multi-spectral **canopy loss** usi
 ## Running the App
 
 ```bash
-pip install streamlit streamlit-folium folium odc-stac pystac-client planetary-computer rasterio scipy numpy pandas pillow xarray
+python -m pip install -r requirements.txt
 python -m streamlit run ui.py
+```

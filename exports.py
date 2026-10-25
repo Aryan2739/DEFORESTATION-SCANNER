@@ -1,6 +1,7 @@
 """Export utilities, image compression, report formatting, and session-scoped persistence."""
 
 import base64
+import csv
 import io
 import json
 import logging
@@ -155,6 +156,29 @@ def make_markdown(r, story):
         story or "_No field notes recorded._",
     ]
     return "\n".join(lines)
+
+
+def make_metrics_csv(r):
+    """Generate RFC 4180 CSV string of metrics, parameters, and accuracy validation."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Metric", "Value"])
+    facts = r.get("facts", {})
+    for k, v in facts.items():
+        writer.writerow([k, str(v)])
+    if "years" in r and r["years"]:
+        writer.writerow(["baseline_year", str(r["years"][0])])
+        writer.writerow(["target_year", str(r["years"][1])])
+    if "scenes" in r and r["scenes"]:
+        writer.writerow(["baseline_scenes", str(r["scenes"][0])])
+        writer.writerow(["target_scenes", str(r["scenes"][1])])
+    if r.get("acc"):
+        acc = r["acc"]
+        for mode in ("strict", "buffered"):
+            if mode in acc and isinstance(acc[mode], dict):
+                for k, v in acc[mode].items():
+                    writer.writerow([f"{mode}_{k}", str(v)])
+    return buf.getvalue()
 
 
 def save_last_result(result_dict, session_id=None):

@@ -4,3 +4,12 @@ primaryColor = "#1f5c3f"
 backgroundColor = "#f4f7f3"
 secondaryBackgroundColor = "#e9efe9"
 textColor = "#10231a"
+
+[client]
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = true
