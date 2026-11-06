@@ -1,4 +1,4 @@
-# Canopy Loss Observatory
+# Deforestation Scanner
 
 A Streamlit geospatial workbench that detects multi-spectral **canopy loss** using cloud-masked **Sentinel-2 L2A** composites from Microsoft Planetary Computer and validates detections against **Hansen Global Forest Change (GFC)**.
 
